@@ -40,7 +40,7 @@ int main(void) {
     dw.Setup(config);
 
     std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> converter;
-    std::wstring wide = converter.from_bytes("abcdeÇ†Ç¢Ç§Ç¶Ç® " ICON_REMIX_FOLDER_FILL);
+    std::wstring wide = converter.from_bytes("abcde „ÅÇ„ÅÇ„ÅÇ„ÅÇ Êó•Êú¨Ë™û " ICON_REMIX_FOLDER_FILL);
     dw.Render(wide.c_str(), 32.0f);
     dw.SaveAsBitmap(L"test.bmp");
 
