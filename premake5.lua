@@ -21,7 +21,7 @@ project "simpledwrite"
     filter { "platforms:x64" }
         system "Windows"
         architecture "x86_64"
-        buildoptions { "/execution-charset:utf-8" }
+        buildoptions { "/execution-charset:utf-8", "/source-charset:utf-8" }
 
     filter "configurations:Debug*"
         defines { "_DEBUG" }
