@@ -198,7 +198,7 @@ bool SimpleDirectWrite::CalcSize(const std::wstring& text, float size,
   return true;
 }
 
-const std::vector<uint8_t>& SimpleDirectWrite::Render(
+std::vector<uint8_t> SimpleDirectWrite::Render(
     const std::wstring& text, float size, const float (&color)[4], bool outline,
     const float (&outline_color)[4], int* out_width, int* out_height) {
   ComPtr<IDWriteTextFormat> format;
@@ -207,19 +207,21 @@ const std::vector<uint8_t>& SimpleDirectWrite::Render(
       DWRITE_FONT_WEIGHT_REGULAR, DWRITE_FONT_STYLE_NORMAL,
       DWRITE_FONT_STRETCH_NORMAL, size, locale_.c_str(), &format));
 
-  ComPtr<IDWriteTextFormat3> format3;
-  format.As(&format3);
   if (fallback_) {
+    ComPtr<IDWriteTextFormat3> format3;
+    format.As(&format3);
     CHECK(format3->SetFontFallback(fallback_.Get()));
   }
 
   ComPtr<IDWriteTextLayout> layout;
-  CHECK(dwritefactory_->CreateTextLayout(
-      text.c_str(), (UINT32)text.length(), format3.Get(),
-      (FLOAT)maxwidth_, (FLOAT)maxheight_, &layout));
+  CHECK(dwritefactory_->CreateTextLayout(text.c_str(), (UINT32)text.length(),
+                                         format.Get(), (FLOAT)maxwidth_,
+                                         (FLOAT)maxheight_, &layout));
 
   DWRITE_TEXT_METRICS metrics{};
   CHECK(layout->GetMetrics(&metrics));
+  roiwidth_ = (int)metrics.width;
+  roiheight_ = (int)metrics.height;
   if (out_width != nullptr) *out_width = (int)metrics.width;
   if (out_height != nullptr) *out_height = (int)metrics.height;
 
@@ -227,7 +229,7 @@ const std::vector<uint8_t>& SimpleDirectWrite::Render(
 
   rendertarget_->BeginDraw();
   {
-    rendertarget_->Clear(D2D1::ColorF(1, 1, 1, 1));
+    rendertarget_->Clear(D2D1::ColorF(0, 0, 0, 0));
     rendertarget_->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
     rendertarget_->SetTransform(D2D1::Matrix3x2F::Identity());
     outlinetextrenderer_.Get()->Setup(color, outline, outline_color);
@@ -236,11 +238,19 @@ const std::vector<uint8_t>& SimpleDirectWrite::Render(
   }
   rendertarget_->EndDraw();
 
-  return buffer_;
+  WICRect rect;
+  rect.X = 0;
+  rect.Y = 0;
+  rect.Width = roiwidth_;
+  rect.Height = roiheight_;
+  std::vector<uint8_t> buf(roiwidth_ * roiheight_ * 4);
+  bitmap_->CopyPixels(&rect, roiwidth_ * 4, roiwidth_ * 4 * roiheight_,
+                      buf.data());
+  return buf;
 }
 
-void SimpleDirectWrite::SaveAsBitmap(const std::wstring& path, int width,
-                                     int height) {
+void SimpleDirectWrite::SaveAsBitmap(const std::wstring& path) {
+  if (!roiwidth_ || !roiheight_) return;
   ComPtr<IStream> file;
   CHECK(::SHCreateStreamOnFileEx(
       path.c_str(), STGM_CREATE | STGM_WRITE | STGM_SHARE_EXCLUSIVE,
@@ -253,11 +263,7 @@ void SimpleDirectWrite::SaveAsBitmap(const std::wstring& path, int width,
   ComPtr<IPropertyBag2> properties;
   CHECK(encoder->CreateNewFrame(&frame, &properties));
   CHECK(frame->Initialize(properties.Get()));
-  UINT w = 0, h = 0;
-  CHECK(bitmap_->GetSize(&w, &h));
-  if (!width) width = w;
-  if (!height) height = h;
-  CHECK(frame->SetSize(width, height));
+  CHECK(frame->SetSize(roiwidth_, roiheight_));
   GUID pixel_format;
   CHECK(bitmap_->GetPixelFormat(&pixel_format));
   CHECK(frame->SetPixelFormat(&pixel_format));
@@ -326,8 +332,8 @@ HRESULT __stdcall TextRenderer::DrawGlyphRun(
                        baselineOriginY + vertical_offset);
   CHECK(d2d1factory_->CreateTransformedGeometry(pathgeometry.Get(), transform,
                                                 &transformedgeometry));
-  rendertarget_->DrawGeometry(transformedgeometry.Get(), outline_brush_.Get(),
-                              3.0f);
+
+  rendertarget_->DrawGeometry(transformedgeometry.Get(), outline_brush_.Get(), 3.0f, strokestyle_.Get());
   rendertarget_->FillGeometry(transformedgeometry.Get(), fill_brush_.Get());
   return S_OK;
 }
@@ -359,6 +365,10 @@ void TextRenderer::Setup(const float (&color)[4], bool outline,
   D2D1::ColorF d2d1outlinecolor(outline_color[0], outline_color[1],
                                 outline_color[2], outline_color[3]);
   CHECK(rendertarget_->CreateSolidColorBrush(d2d1color, &fill_brush_));
-  CHECK(
-      rendertarget_->CreateSolidColorBrush(d2d1outlinecolor, &outline_brush_));
+  CHECK(rendertarget_->CreateSolidColorBrush(d2d1outlinecolor, &outline_brush_));
+
+  D2D1_STROKE_STYLE_PROPERTIES strokeprops = D2D1::StrokeStyleProperties();
+  strokeprops.lineJoin = D2D1_LINE_JOIN_ROUND;
+  d2d1factory_->CreateStrokeStyle(&strokeprops, NULL, 0, &strokestyle_);
 }
+

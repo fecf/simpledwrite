@@ -14,11 +14,10 @@ int main(void) {
   try {
     ::CoInitialize(NULL);
 
-    NONCLIENTMETRICSW ncm{sizeof(ncm)};
-    ::SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, 0, &ncm, 0);
-    std::wstring systemfont = ncm.lfMessageFont.lfFaceName;
+    // NONCLIENTMETRICSW ncm{sizeof(ncm)};
+    // ::SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, 0, &ncm, 0);
+    // std::wstring systemfont = ncm.lfMessageFont.lfFaceName;
 
-    SimpleDirectWrite dw;
     SimpleDirectWrite::Config config;
     config.locale = L"ja-JP";
     config.fonts.push_back(SimpleDirectWrite::Config::Font(L"Arial"));
@@ -32,16 +31,23 @@ int main(void) {
     config.fallbacks.push_back(SimpleDirectWrite::Config::Fallback(L"Meiryo", jp));
     config.fallbacks.push_back(SimpleDirectWrite::Config::Fallback(
         L"remixicon", {{ICON_REMIX_RANGE_MIN, ICON_REMIX_RANGE_MAX}}));
+
+    SimpleDirectWrite dw;
     dw.Setup(config);
 
     std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> converter;
     std::wstring wide =
         converter.from_bytes("abcde あいうえお 骨肉刃" ICON_REMIX_FOLDER_FILL ICON_REMIX_ARROW_DOWN_FILL);
-    int ow, oh;
     float fill[4] = {1, 1, 1, 1};
     float outline[4] = {0, 0, 0, 1};
-    dw.Render(wide.c_str(), 32.0f, fill, true, outline, &ow, &oh);
-    dw.SaveAsBitmap(L"test.bmp", ow, oh);
+    int ow, oh;
+    std::vector<uint8_t> buf = dw.Render(wide.c_str(), 32.0f, fill, true, outline, &ow, &oh);
+
+    std::ofstream ofs("test.bin", std::ios::out | std::ios::binary);
+    ofs.write((const char*)buf.data(), buf.size());
+    ofs.close();
+
+    dw.SaveAsBitmap(L"test.bmp");
   } catch (std::exception& ex) {
     std::cerr << ex.what() << std::endl;
   }
