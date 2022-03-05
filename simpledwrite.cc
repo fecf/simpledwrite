@@ -1,12 +1,21 @@
 #include "simpledwrite.h"
 
+#include <combaseapi.h>
 #include <comdef.h>
+#include <d2d1_3.h>
+#include <dwrite_3.h>
 #include <shellapi.h>
 #include <shlwapi.h>
+#include <wincodec.h>
+#include <winrt/base.h>
+#include <wrl.h>
 
+#include <functional>
 #include <iostream>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
@@ -22,353 +31,466 @@
     ss << "failed at " << file << "@" << line << " reason=" << errmsg; \
     throw std::runtime_error(ss.str());                                \
   }
-
 #define CHECK(hr) CHECK_(hr, __FILE__, STR(__LINE__))
 
-SimpleDirectWrite::~SimpleDirectWrite() = default;
+using namespace Microsoft::WRL;
 
-bool SimpleDirectWrite::Setup(const Config& config) {
-  buffer_.resize(4 * maxwidth_ * maxheight_);
-  CHECK(wicimagingfactory_->CreateBitmapFromMemory(
-      maxwidth_, maxheight_, GUID_WICPixelFormat32bppPBGRA, 4 * maxwidth_,
-      4 * maxwidth_ * maxheight_, (BYTE*)buffer_.data(), &bitmap_));
-  D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
-      D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1::PixelFormat(),
-      (FLOAT)::GetDpiForSystem(), (FLOAT)::GetDpiForSystem());
-  CHECK(d2d1factory_->CreateWicBitmapRenderTarget(bitmap_.Get(), &props,
-                                                  &rendertarget_));
+namespace simpledwrite {
 
-  if (config.locale.empty()) {
+constexpr int kMaxLayoutSize = 16384;
+
+inline std::string utf16_to_utf8(const std::wstring& wstr) {
+  winrt::hstring hstr(wstr);
+  return winrt::to_string(hstr);
+}
+
+inline std::wstring utf8_to_utf16(const std::string& str) {
+  winrt::hstring hstr = winrt::to_hstring(str);
+  return (std::wstring)hstr;
+}
+
+// ref.
+// https://stackoverflow.com/questions/66872711/directwrite-direct2d-custom-text-rendering-is-hairy
+class TextRenderer
+    : public RuntimeClass<RuntimeClassFlags<ClassicCom>, IDWriteTextRenderer> {
+ public:
+  TextRenderer(ComPtr<ID2D1Factory7> d2d1factory,
+      std::function<float(IDWriteFontFace*)> rendercallback)
+      : d2d1factory_(d2d1factory),
+        rendercallback_(rendercallback),
+        outline_width_(0) {
+    D2D1_STROKE_STYLE_PROPERTIES strokeprops = D2D1::StrokeStyleProperties();
+    strokeprops.lineJoin = D2D1_LINE_JOIN_ROUND;
+    d2d1factory_->CreateStrokeStyle(&strokeprops, NULL, 0, &strokestyle_);
+  }
+  virtual ~TextRenderer() = default;
+
+ protected:
+  virtual HRESULT __stdcall IsPixelSnappingDisabled(
+      void* clientDrawingContext, BOOL* isDisabled) override {
+    *isDisabled = FALSE;
+    return S_OK;
+  }
+  virtual HRESULT __stdcall GetCurrentTransform(
+      void* clientDrawingContext, DWRITE_MATRIX* transform) override {
+    rendertarget_->GetTransform((D2D1_MATRIX_3X2_F*)transform);
+    return S_OK;
+  }
+  virtual HRESULT __stdcall GetPixelsPerDip(
+      void* clientDrawingContext, FLOAT* pixelsPerDip) override {
+    FLOAT dpi_x, dpi_y;
+    rendertarget_->GetDpi(&dpi_x, &dpi_y);
+    *pixelsPerDip = dpi_y / 96.0f;
+    return S_OK;
+  }
+  virtual HRESULT __stdcall DrawGlyphRun(void* clientDrawingContext,
+      FLOAT baselineOriginX, FLOAT baselineOriginY,
+      DWRITE_MEASURING_MODE measuringMode, DWRITE_GLYPH_RUN const* glyphRun,
+      DWRITE_GLYPH_RUN_DESCRIPTION const* glyphRunDescription,
+      IUnknown* clientDrawingEffect) override {
+    ComPtr<ID2D1PathGeometry> pathgeometry;
+    CHECK(d2d1factory_->CreatePathGeometry(&pathgeometry));
+    ComPtr<ID2D1GeometrySink> geometrysink;
+    CHECK(pathgeometry->Open(&geometrysink));
+    CHECK(glyphRun->fontFace->GetGlyphRunOutline(glyphRun->fontEmSize,
+        glyphRun->glyphIndices, glyphRun->glyphAdvances, glyphRun->glyphOffsets,
+        glyphRun->glyphCount, glyphRun->isSideways, glyphRun->bidiLevel % 2,
+        geometrysink.Get()));
+    CHECK(geometrysink->Close());
+
+    float vertical_offset = rendercallback_(glyphRun->fontFace);
+
+    {
+      D2D1::ColorF d2d1color(
+          fill_color_.r, fill_color_.g, fill_color_.b, fill_color_.a);
+      CHECK(rendertarget_->CreateSolidColorBrush(d2d1color, &fill_brush_));
+    }
+    {
+      D2D1::ColorF d2d1color(outline_color_.r, outline_color_.g,
+          outline_color_.b, outline_color_.a);
+      CHECK(rendertarget_->CreateSolidColorBrush(d2d1color, &outline_brush_));
+    }
+
+    D2D1::Matrix3x2F transform = D2D1::Matrix3x2F(1.0f, 0.0f, 0.0f, 1.0f,
+        baselineOriginX, baselineOriginY + vertical_offset);
+    ComPtr<ID2D1TransformedGeometry> transformedgeometry;
+    CHECK(d2d1factory_->CreateTransformedGeometry(
+        pathgeometry.Get(), transform, &transformedgeometry));
+    if (outline_width_) {
+      rendertarget_->DrawGeometry(transformedgeometry.Get(),
+          outline_brush_.Get(), static_cast<FLOAT>(outline_width_),
+          strokestyle_.Get());
+    }
+    rendertarget_->FillGeometry(transformedgeometry.Get(), fill_brush_.Get());
+
+    return S_OK;
+  }
+  virtual HRESULT __stdcall DrawUnderline(void* clientDrawingContext,
+      FLOAT baselineOriginX, FLOAT baselineOriginY,
+      DWRITE_UNDERLINE const* underline,
+      IUnknown* clientDrawingEffect) override {
+    return E_NOTIMPL;
+  }
+  virtual HRESULT __stdcall DrawStrikethrough(void* clientDrawingContext,
+      FLOAT baselineOriginX, FLOAT baselineOriginY,
+      DWRITE_STRIKETHROUGH const* strikethrough,
+      IUnknown* clientDrawingEffect) override {
+    return E_NOTIMPL;
+  }
+  virtual HRESULT __stdcall DrawInlineObject(void* clientDrawingContext,
+      FLOAT originX, FLOAT originY, IDWriteInlineObject* inlineObject,
+      BOOL isSideways, BOOL isRightToLeft,
+      IUnknown* clientDrawingEffect) override {
+    return E_NOTIMPL;
+  }
+
+ public:
+  void SetRenderTarget(ComPtr<ID2D1RenderTarget> rendertarget) {
+    rendertarget_ = rendertarget;
+  }
+  void SetOutline(float width, Color color) {
+    outline_width_ = width;
+    outline_color_ = color;
+  };
+  void SetFill(Color color) { fill_color_ = color; };
+
+ private:
+  ComPtr<ID2D1Factory7> d2d1factory_;
+  ComPtr<ID2D1RenderTarget> rendertarget_;
+  std::function<float(IDWriteFontFace*)> rendercallback_;
+
+  Color fill_color_;
+  float outline_width_ = 0.0f;
+  Color outline_color_;
+  ComPtr<ID2D1SolidColorBrush> fill_brush_;
+  ComPtr<ID2D1SolidColorBrush> outline_brush_;
+  ComPtr<ID2D1StrokeStyle> strokestyle_;
+};
+
+class SimpleDWriteImpl {
+ public:
+  SimpleDWriteImpl() {
+    CHECK(::D2D1CreateFactory<ID2D1Factory7>(
+        D2D1_FACTORY_TYPE_SINGLE_THREADED, &d2d1factory));
+    CHECK(::DWriteCreateFactory(
+        DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory7), &dwritefactory));
+    CHECK(::CoCreateInstance(CLSID_WICImagingFactory2, nullptr,
+        CLSCTX_INPROC_SERVER, __uuidof(IWICImagingFactory2),
+        &wicimagingfactory));
+    textrenderer =
+        Make<TextRenderer>(d2d1factory, [=](IDWriteFontFace* ff) -> float {
+          ComPtr<IDWriteFontFace5> ff5;
+          CHECK(ff->QueryInterface<IDWriteFontFace5>(&ff5));
+          ComPtr<IDWriteLocalizedStrings> names;
+          CHECK(ff5->GetFamilyNames(&names));
+          static wchar_t buf[1024];
+          CHECK(names->GetString(0, buf, 1024));
+          std::wstring wstr(buf);
+          if (fontfamilymap.count(wstr)) {
+            float offset = fontfamilymap.at(wstr)->vertical_offset;
+            return offset;
+          }
+          return 0.0f;
+        });
+  }
+  virtual ~SimpleDWriteImpl() = default;
+
+  ComPtr<ID2D1Factory7> d2d1factory;
+  ComPtr<IDWriteFactory7> dwritefactory;
+  ComPtr<IWICImagingFactory2> wicimagingfactory;
+  ComPtr<IDWriteFontSet> fontset;
+  ComPtr<IDWriteFontCollection1> fontcollection;
+  ComPtr<IDWriteFontFallback> fallback;
+  ComPtr<TextRenderer> textrenderer;
+  ComPtr<IWICBitmap> wicbitmap;
+  std::unordered_map<std::wstring, Font*> fontfamilymap;
+  std::wstring firstfamilyname;
+};
+
+Font::Font(const std::string& name, float vertical_offset)
+    : name(name), data(), data_size(), vertical_offset(vertical_offset) {}
+
+Font::Font(const void* data, size_t data_size, float vertical_offset)
+    : name(),
+      data(data),
+      data_size(data_size),
+      vertical_offset(vertical_offset) {}
+
+FallbackFont::FallbackFont(const std::string& family,
+    const std::vector<std::pair<uint32_t, uint32_t>>& ranges)
+    : family(family), ranges(ranges) {}
+
+FontSet FontSet::Default() {
+  static FontSet fontset;
+  static std::once_flag once;
+  std::call_once(once, [&] {
     wchar_t locale[LOCALE_NAME_MAX_LENGTH];
     int ret = ::GetUserDefaultLocaleName(locale, LOCALE_NAME_MAX_LENGTH);
-    if (ret) {
-      locale_ = locale;
-    }
-  }
+    fontset.locale = utf16_to_utf8(locale);
+  });
+  return fontset;
+}
 
-  ComPtr<IDWriteInMemoryFontFileLoader> memoryfontfileloader;
-  CHECK(dwritefactory_->CreateInMemoryFontFileLoader(&memoryfontfileloader));
-  CHECK(dwritefactory_->RegisterFontFileLoader(memoryfontfileloader.Get()));
+FontSet::FontSet() {}
 
-  ComPtr<IDWriteFontSetBuilder2> fontsetbuilder;
-  CHECK(dwritefactory_->CreateFontSetBuilder(&fontsetbuilder));
+SimpleDWrite::SimpleDWrite()
+    : dpi_((float)::GetDpiForSystem()), impl(new SimpleDWriteImpl()) {}
 
-  ComPtr<IDWriteFontCollection> systemfontcollection;
-  CHECK(dwritefactory_->GetSystemFontCollection(&systemfontcollection));
+SimpleDWrite::~SimpleDWrite() {}
 
-  std::vector<Config::Font*> fontconfiglist;
-  for (const Config::Font& font : config.fonts) {
-    if (!font.name.empty()) {
-      UINT32 index = 0;
-      BOOL exists = FALSE;
-      CHECK(systemfontcollection->FindFamilyName(font.name.c_str(), &index, &exists));
-      if (!exists) {
-        continue;
+bool SimpleDWrite::Init(const FontSet& fs, float dpi) {
+  fs_ = fs;
+  dpi_ = dpi;
+
+  try {
+    if (fs.locale.empty()) {
+      wchar_t locale[LOCALE_NAME_MAX_LENGTH];
+      int ret = ::GetUserDefaultLocaleName(locale, LOCALE_NAME_MAX_LENGTH);
+      if (ret) {
+        fs_.locale = utf16_to_utf8(locale);
       }
+    }
 
-      ComPtr<IDWriteFontFamily> fontfamily;
-      CHECK(systemfontcollection->GetFontFamily(index, &fontfamily));
-      ComPtr<IDWriteFontSetBuilder2> fontsetbuilder2;
-      CHECK(dwritefactory_->CreateFontSetBuilder(&fontsetbuilder2));
-      UINT32 count = fontfamily->GetFontCount();
-      for (UINT32 i = 0; i < count; ++i) {
-        ComPtr<IDWriteFont> font;
-        CHECK(fontfamily->GetFont(i, &font));
-        ComPtr<IDWriteFont3> font3;
-        CHECK(font.As(&font3));
+    ComPtr<IDWriteFactory7> factory = impl->dwritefactory;
+    ComPtr<IDWriteInMemoryFontFileLoader> memoryfontfileloader;
+    CHECK(factory->CreateInMemoryFontFileLoader(&memoryfontfileloader));
+    CHECK(factory->RegisterFontFileLoader(memoryfontfileloader.Get()));
 
-        ComPtr<IDWriteFontFaceReference> fontfacereference;
-        CHECK(font3->GetFontFaceReference(&fontfacereference));
+    ComPtr<IDWriteFontSetBuilder2> fontsetbuilder;
+    CHECK(factory->CreateFontSetBuilder(&fontsetbuilder));
 
-        CHECK(fontsetbuilder2->AddFontFaceReference(fontfacereference.Get()));
+    ComPtr<IDWriteFontCollection> systemfontcollection;
+    CHECK(factory->GetSystemFontCollection(&systemfontcollection));
+
+    std::vector<Font*> fontconfiglist;
+    for (const Font& font : fs.fonts) {
+      if (!font.name.empty()) {
+        UINT32 index = 0;
+        BOOL exists = FALSE;
+        CHECK(systemfontcollection->FindFamilyName(
+            utf8_to_utf16(font.name).c_str(), &index, &exists));
+        if (!exists) {
+          continue;
+        }
+
+        ComPtr<IDWriteFontFamily> fontfamily;
+        CHECK(systemfontcollection->GetFontFamily(index, &fontfamily));
+        ComPtr<IDWriteFontSetBuilder2> fontsetbuilder2;
+        CHECK(factory->CreateFontSetBuilder(&fontsetbuilder2));
+        UINT32 count = fontfamily->GetFontCount();
+        for (UINT32 i = 0; i < count; ++i) {
+          ComPtr<IDWriteFont> font;
+          CHECK(fontfamily->GetFont(i, &font));
+          ComPtr<IDWriteFont3> font3;
+          CHECK(font.As(&font3));
+          ComPtr<IDWriteFontFaceReference> fontfacereference;
+          CHECK(font3->GetFontFaceReference(&fontfacereference));
+          CHECK(fontsetbuilder2->AddFontFaceReference(fontfacereference.Get()));
+        }
+        ComPtr<IDWriteFontSet> systemfontset;
+        CHECK(fontsetbuilder2->CreateFontSet(&systemfontset));
+        CHECK(fontsetbuilder->AddFontSet(systemfontset.Get()));
+        fontconfiglist.insert(fontconfiglist.end(), (size_t)1, (Font*)&font);
+      } else if (font.data != nullptr && font.data_size) {
+        ComPtr<IDWriteFontFile> fontfile;
+        CHECK(memoryfontfileloader->CreateInMemoryFontFileReference(
+            factory.Get(), font.data, (UINT32)font.data_size, NULL, &fontfile));
+        BOOL supported = FALSE;
+        DWRITE_FONT_FILE_TYPE filetype{};
+        DWRITE_FONT_FACE_TYPE facetype{};
+        UINT32 faces = 0;
+        CHECK(fontfile->Analyze(&supported, &filetype, &facetype, &faces));
+        if (supported && faces) {
+          CHECK(fontsetbuilder->AddFontFile(fontfile.Get()));
+        }
+        fontconfiglist.insert(
+            fontconfiglist.end(), (size_t)faces, (Font*)&font);
       }
-      ComPtr<IDWriteFontSet> systemfontset;
-      CHECK(fontsetbuilder2->CreateFontSet(&systemfontset));
-      CHECK(fontsetbuilder->AddFontSet(systemfontset.Get()));
-      fontconfiglist.insert(fontconfiglist.end(), (size_t)1,
-                            (Config::Font*)&font);
-    } else if (font.data != nullptr && font.size) {
-      ComPtr<IDWriteFontFile> fontfile;
-      CHECK(memoryfontfileloader->CreateInMemoryFontFileReference(
-          dwritefactory_.Get(), font.data, (UINT32)font.size, NULL, &fontfile));
-      BOOL supported = FALSE;
-      DWRITE_FONT_FILE_TYPE filetype{};
-      DWRITE_FONT_FACE_TYPE facetype{};
-      UINT32 faces = 0;
-      CHECK(fontfile->Analyze(&supported, &filetype, &facetype, &faces));
-      if (supported && faces) {
-        CHECK(fontsetbuilder->AddFontFile(fontfile.Get()));
+    }
+
+    CHECK(fontsetbuilder->CreateFontSet(&impl->fontset));
+    CHECK(factory->CreateFontCollectionFromFontSet(
+        impl->fontset.Get(), &impl->fontcollection));
+    impl->firstfamilyname.clear();
+    for (int i = 0; i < (int)fontconfiglist.size(); ++i) {
+      ComPtr<IDWriteFontFamily1> fontfamily;
+      CHECK(impl->fontcollection->GetFontFamily(i, &fontfamily));
+      ComPtr<IDWriteLocalizedStrings> names;
+      CHECK(fontfamily->GetFamilyNames(&names));
+      UINT32 count = names->GetCount();
+      thread_local wchar_t familyname[1024];
+      if (i == 0) {
+        CHECK(names->GetString(0, familyname, 1024));
+        impl->firstfamilyname = familyname;
       }
-      fontconfiglist.insert(fontconfiglist.end(), (size_t)faces,
-                            (Config::Font*)&font);
+      for (UINT32 j = 0; j < count; ++j) {
+        CHECK(names->GetString(j, familyname, 1024));
+      }
+      impl->fontfamilymap[familyname] = fontconfiglist[i];
     }
-  }
-
-  CHECK(fontsetbuilder->CreateFontSet(&fontset_));
-  CHECK(dwritefactory_->CreateFontCollectionFromFontSet(fontset_.Get(),
-                                                        &fontcollection_));
-  firstfamilyname_.clear();
-  for (int i = 0; i < (int)fontconfiglist.size(); ++i) {
-    ComPtr<IDWriteFontFamily1> fontfamily;
-    CHECK(fontcollection_->GetFontFamily(i, &fontfamily));
-
-    ComPtr<IDWriteLocalizedStrings> names;
-    CHECK(fontfamily->GetFamilyNames(&names));
-    UINT32 count = names->GetCount();
-
-    static wchar_t familyname[1024];
-
-    if (i == 0) {
-      CHECK(names->GetString(0, familyname, 1024));
-      firstfamilyname_ = familyname;
+    if (impl->firstfamilyname.empty()) {
+      last_error_ = "font not found.";
+      return false;
     }
 
-    for (UINT32 j = 0; j < count; ++j) {
-      CHECK(names->GetString(j, familyname, 1024));
+    ComPtr<IDWriteFontFallbackBuilder> fallbackbuilder;
+    CHECK(factory->CreateFontFallbackBuilder(&fallbackbuilder));
+    for (const FallbackFont& fallback : fs.fallbacks) {
+      std::vector<DWRITE_UNICODE_RANGE> ranges;
+      for (const std::pair<uint32_t, uint32_t>& pair : fallback.ranges) {
+        DWRITE_UNICODE_RANGE range{};
+        range.first = pair.first;
+        range.last = pair.second;
+        ranges.push_back(range);
+      }
+      const std::wstring wfamily = utf8_to_utf16(fallback.family);
+      const wchar_t* wfamilyptr = wfamily.c_str();
+      CHECK(fallbackbuilder->AddMapping(
+          (const DWRITE_UNICODE_RANGE*)ranges.data(), (UINT32)ranges.size(),
+          (const WCHAR**)&wfamilyptr, 1, impl->fontcollection.Get()));
     }
-
-    fontfamilymap_[familyname] = fontconfiglist[i];
-  }
-
-  if (firstfamilyname_.empty()) {
+    CHECK(fallbackbuilder->CreateFontFallback(&impl->fallback));
+    return true;
+  } catch (std::exception& ex) {
+    last_error_ = ex.what();
     return false;
   }
+  return false;
+}
 
-  ComPtr<IDWriteFontFallbackBuilder> fallbackbuilder;
-  CHECK(dwritefactory_->CreateFontFallbackBuilder(&fallbackbuilder));
-  for (const Config::Fallback& fallback : config.fallbacks) {
-    std::vector<DWRITE_UNICODE_RANGE> ranges;
-    for (const std::pair<uint32_t, uint32_t>& pair : fallback.ranges) {
-      DWRITE_UNICODE_RANGE range{};
-      range.first = pair.first;
-      range.last = pair.second;
-      ranges.push_back(range);
+bool SimpleDWrite::CalcSize(const std::string& text, int font_size,
+    int* out_width, int* out_height, int* out_buffer_size,
+    const Layout& layout) const {
+  const float dip = font_size / (dpi_ / 96.0f);
+
+  try {
+    ComPtr<IDWriteTextFormat> format;
+    CHECK(impl->dwritefactory->CreateTextFormat(impl->firstfamilyname.c_str(),
+        impl->fontcollection.Get(), (DWRITE_FONT_WEIGHT)layout.font_weight,
+        (DWRITE_FONT_STYLE)layout.font_style,
+        (DWRITE_FONT_STRETCH)layout.font_stretch, dip,
+        utf8_to_utf16(fs_.locale).c_str(), &format));
+
+    if (impl->fallback) {
+      ComPtr<IDWriteTextFormat3> format3;
+      format.As(&format3);
+      CHECK(format3->SetFontFallback(impl->fallback.Get()));
     }
-    const wchar_t* family = fallback.family.c_str();
-    CHECK(fallbackbuilder->AddMapping(
-        (const DWRITE_UNICODE_RANGE*)ranges.data(), (UINT32)ranges.size(),
-        (const WCHAR**)&family, 1, fontcollection_.Get()));
+
+    ComPtr<IDWriteTextLayout> textlayout;
+    std::wstring wtext = utf8_to_utf16(text);
+    float max_width = layout.max_width ? layout.max_width : kMaxLayoutSize;
+    float max_height = layout.max_height ? layout.max_height : kMaxLayoutSize;
+    CHECK(impl->dwritefactory->CreateTextLayout(wtext.c_str(),
+        (UINT32)wtext.length(), format.Get(), max_width, max_height,
+        &textlayout));
+    textlayout->SetWordWrapping((DWRITE_WORD_WRAPPING)layout.word_wrap_mode);
+
+    DWRITE_TEXT_METRICS metrics{};
+    CHECK(textlayout->GetMetrics(&metrics));
+    int iw = (int)(metrics.width + 0.5f);
+    int ih = (int)(metrics.height + 0.5f);
+    if (out_width != nullptr) *out_width = iw;
+    if (out_height != nullptr) *out_height = ih;
+    if (out_buffer_size != nullptr) *out_buffer_size = iw * 4 * ih;
+    return true;
+  } catch (std::exception& ex) {
+    last_error_ = ex.what();
+    return false;
   }
-  CHECK(fallbackbuilder->CreateFontFallback(&fallback_));
-
-  outlinetextrenderer_ = Make<TextRenderer>(
-      d2d1factory_, rendertarget_, [=](IDWriteFontFace* ff) -> float {
-        ComPtr<IDWriteFontFace5> ff5;
-        CHECK(ff->QueryInterface<IDWriteFontFace5>(&ff5));
-
-        ComPtr<IDWriteLocalizedStrings> names;
-        CHECK(ff5->GetFamilyNames(&names));
-        static wchar_t buf[1024];
-        CHECK(names->GetString(0, buf, 1024));
-
-        std::wstring wstr(buf);
-        if (fontfamilymap_.count(wstr)) {
-          float offset = fontfamilymap_.at(wstr)->vertical_offset;
-          return offset;
-        }
-        return 0.0f;
-      });
-
-  return true;
 }
 
-bool SimpleDirectWrite::CalcSize(const std::wstring& text, float size,
-                                 int* width, int* height) {
-  ComPtr<IDWriteTextFormat> format;
-  CHECK(dwritefactory_->CreateTextFormat(
-      firstfamilyname_.c_str(), fontcollection_.Get(),
-      DWRITE_FONT_WEIGHT_REGULAR, DWRITE_FONT_STYLE_NORMAL,
-      DWRITE_FONT_STRETCH_NORMAL, size, locale_.c_str(), &format));
+bool SimpleDWrite::Render(const std::string& text, int font_size,
+    uint8_t* buffer, int buffer_size, const Layout& layout,
+    const RenderParams& renderparams, int* out_width, int* out_height) const {
+  const float dip = font_size / (dpi_ / 96.0f);
 
-  ComPtr<IDWriteTextFormat3> format3;
-  format.As(&format3);
-  if (fallback_) {
-    CHECK(format3->SetFontFallback(fallback_.Get()));
+  try {
+    ComPtr<IDWriteTextFormat> format;
+    CHECK(impl->dwritefactory->CreateTextFormat(impl->firstfamilyname.c_str(),
+        impl->fontcollection.Get(), (DWRITE_FONT_WEIGHT)layout.font_weight,
+        (DWRITE_FONT_STYLE)layout.font_style,
+        (DWRITE_FONT_STRETCH)layout.font_stretch, dip,
+        utf8_to_utf16(fs_.locale).c_str(), &format));
+
+    if (impl->fallback) {
+      ComPtr<IDWriteTextFormat3> format3;
+      format.As(&format3);
+      CHECK(format3->SetFontFallback(impl->fallback.Get()));
+    }
+
+    std::wstring wtext = utf8_to_utf16(text);
+    ComPtr<IDWriteTextLayout> textlayout;
+    float max_width = layout.max_width ? layout.max_width : kMaxLayoutSize;
+    float max_height = layout.max_height ? layout.max_height : kMaxLayoutSize;
+    CHECK(impl->dwritefactory->CreateTextLayout(wtext.c_str(),
+        (UINT32)wtext.length(), format.Get(), max_width, max_height,
+        &textlayout));
+    textlayout->SetWordWrapping((DWRITE_WORD_WRAPPING)layout.word_wrap_mode);
+
+    DWRITE_TEXT_METRICS metrics{};
+    CHECK(textlayout->GetMetrics(&metrics));
+    int iw = (int)(metrics.width + 0.5f);
+    int ih = (int)(metrics.height + 0.5f);
+    if (out_width != nullptr) *out_width = iw;
+    if (out_height != nullptr) *out_height = ih;
+    const size_t required_size = iw * 4 * ih;
+    if (required_size > buffer_size) {
+      last_error_ = "not enough buffer size.";
+      return false;
+    }
+
+    ComPtr<IWICBitmap> bitmap;
+    CHECK(impl->wicimagingfactory->CreateBitmapFromMemory((UINT)iw, (UINT)ih,
+        GUID_WICPixelFormat32bppPBGRA, (UINT)(iw * 4), (UINT)(iw * 4 * ih),
+        buffer, &bitmap));
+
+    ComPtr<ID2D1RenderTarget> rendertarget;
+    D2D1_RENDER_TARGET_PROPERTIES props =
+        D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            D2D1::PixelFormat(
+                DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+            (FLOAT)dpi_, (FLOAT)dpi_);
+    CHECK(impl->d2d1factory->CreateWicBitmapRenderTarget(
+        bitmap.Get(), &props, &rendertarget));
+    impl->textrenderer->SetRenderTarget(rendertarget);
+
+    rendertarget->BeginDraw();
+    rendertarget->Clear(D2D1::ColorF(renderparams.background_color.r,
+        renderparams.background_color.g, renderparams.background_color.b,
+        renderparams.background_color.a));
+    rendertarget->SetTextAntialiasMode(static_cast<D2D1_TEXT_ANTIALIAS_MODE>(
+        renderparams.text_antialias_mode));
+    rendertarget->SetAntialiasMode(
+        static_cast<D2D1_ANTIALIAS_MODE>(renderparams.antialias_mode));
+    rendertarget->SetTransform(D2D1::Matrix3x2F::Identity());
+    ComPtr<ID2D1SolidColorBrush> brush;
+
+    rendertarget->CreateSolidColorBrush(
+        D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f), &brush);
+    impl->textrenderer->SetFill(renderparams.foreground_color);
+    impl->textrenderer->SetOutline(
+        renderparams.outline_width, renderparams.outline_color);
+    textlayout->Draw(
+        NULL, (IDWriteTextRenderer*)impl->textrenderer.Get(), 0.0f, 0.0f);
+    rendertarget->EndDraw();
+
+    WICRect rect{};
+    rect.Width = (INT)iw;
+    rect.Height = (INT)ih;
+    const int stride = rect.Width * 4;
+    if (stride * rect.Height > buffer_size) {
+      last_error_ = "not enough buffer size.";
+      return false;
+    }
+    bitmap->CopyPixels(&rect, stride, static_cast<UINT>(buffer_size), buffer);
+    return true;
+  } catch (std::exception& ex) {
+    last_error_ = ex.what();
+    return false;
   }
-
-  ComPtr<IDWriteTextLayout> layout;
-  CHECK(dwritefactory_->CreateTextLayout(text.c_str(), (UINT32)text.length(),
-                                         format3.Get(), (FLOAT)maxwidth_,
-                                         (FLOAT)maxheight_, &layout));
-
-  DWRITE_TEXT_METRICS metrics{};
-  CHECK(layout->GetMetrics(&metrics));
-  *width = (int)metrics.width;
-  *height = (int)metrics.height;
-  return true;
 }
 
-std::vector<uint8_t> SimpleDirectWrite::Render(
-    const std::wstring& text, float size, const float (&color)[4], bool outline,
-    const float (&outline_color)[4], int* out_width, int* out_height) {
-  ComPtr<IDWriteTextFormat> format;
-  CHECK(dwritefactory_->CreateTextFormat(
-      firstfamilyname_.c_str(), fontcollection_.Get(),
-      DWRITE_FONT_WEIGHT_REGULAR, DWRITE_FONT_STYLE_NORMAL,
-      DWRITE_FONT_STRETCH_NORMAL, size, locale_.c_str(), &format));
+std::string SimpleDWrite::GetLastError() const { return std::string(); }
 
-  if (fallback_) {
-    ComPtr<IDWriteTextFormat3> format3;
-    format.As(&format3);
-    CHECK(format3->SetFontFallback(fallback_.Get()));
-  }
-
-  ComPtr<IDWriteTextLayout> layout;
-  CHECK(dwritefactory_->CreateTextLayout(text.c_str(), (UINT32)text.length(),
-                                         format.Get(), (FLOAT)maxwidth_,
-                                         (FLOAT)maxheight_, &layout));
-
-  DWRITE_TEXT_METRICS metrics{};
-  CHECK(layout->GetMetrics(&metrics));
-  roiwidth_ = (int)metrics.width;
-  roiheight_ = (int)metrics.height;
-  if (out_width != nullptr) *out_width = (int)metrics.width;
-  if (out_height != nullptr) *out_height = (int)metrics.height;
-
-  outlinetextrenderer_.Get()->Setup(color, outline, outline_color);
-
-  rendertarget_->BeginDraw();
-  {
-    rendertarget_->Clear(D2D1::ColorF(0, 0, 0, 0));
-    rendertarget_->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-    rendertarget_->SetTransform(D2D1::Matrix3x2F::Identity());
-    outlinetextrenderer_.Get()->Setup(color, outline, outline_color);
-    layout->Draw(NULL, (IDWriteTextRenderer*)outlinetextrenderer_.Get(), 0.0f,
-                 0.0f);
-  }
-  rendertarget_->EndDraw();
-
-  WICRect rect;
-  rect.X = 0;
-  rect.Y = 0;
-  rect.Width = roiwidth_;
-  rect.Height = roiheight_;
-  std::vector<uint8_t> buf(roiwidth_ * roiheight_ * 4);
-  bitmap_->CopyPixels(&rect, roiwidth_ * 4, roiwidth_ * 4 * roiheight_,
-                      buf.data());
-  return buf;
-}
-
-void SimpleDirectWrite::SaveAsBitmap(const std::wstring& path) {
-  if (!roiwidth_ || !roiheight_) return;
-  ComPtr<IStream> file;
-  CHECK(::SHCreateStreamOnFileEx(
-      path.c_str(), STGM_CREATE | STGM_WRITE | STGM_SHARE_EXCLUSIVE,
-      FILE_ATTRIBUTE_NORMAL, TRUE, nullptr, &file));
-  ComPtr<IWICBitmapEncoder> encoder;
-  auto guid = GUID_ContainerFormatBmp;
-  CHECK(wicimagingfactory_->CreateEncoder(guid, nullptr, &encoder));
-  CHECK(encoder->Initialize(file.Get(), WICBitmapEncoderNoCache));
-  ComPtr<IWICBitmapFrameEncode> frame;
-  ComPtr<IPropertyBag2> properties;
-  CHECK(encoder->CreateNewFrame(&frame, &properties));
-  CHECK(frame->Initialize(properties.Get()));
-  CHECK(frame->SetSize(roiwidth_, roiheight_));
-  GUID pixel_format;
-  CHECK(bitmap_->GetPixelFormat(&pixel_format));
-  CHECK(frame->SetPixelFormat(&pixel_format));
-  CHECK(frame->WriteSource(bitmap_.Get(), nullptr));
-  CHECK(frame->Commit());
-  CHECK(encoder->Commit());
-}
-
-SimpleDirectWrite::SimpleDirectWrite() {
-  CHECK(::CoCreateInstance(CLSID_WICImagingFactory2, nullptr,
-                           CLSCTX_INPROC_SERVER, __uuidof(IWICImagingFactory2),
-                           &wicimagingfactory_));
-  CHECK(::D2D1CreateFactory<ID2D1Factory7>(D2D1_FACTORY_TYPE_SINGLE_THREADED,
-                                           &d2d1factory_));
-  CHECK(::DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,
-                              __uuidof(IDWriteFactory7), &dwritefactory_));
-}
-
-TextRenderer::TextRenderer(
-    ComPtr<ID2D1Factory7> d2d1factory, ComPtr<ID2D1RenderTarget> rendertarget,
-    std::function<float(IDWriteFontFace*)> rendercallback)
-    : d2d1factory_(d2d1factory),
-      rendertarget_(rendertarget),
-      rendercallback_(rendercallback) {}
-
-HRESULT __stdcall TextRenderer::IsPixelSnappingDisabled(
-    void* clientDrawingContext, BOOL* isDisabled) {
-  *isDisabled = FALSE;
-  return S_OK;
-}
-
-HRESULT __stdcall TextRenderer::GetCurrentTransform(void* clientDrawingContext,
-                                                    DWRITE_MATRIX* transform) {
-  rendertarget_->GetTransform((D2D1_MATRIX_3X2_F*)transform);
-  return S_OK;
-}
-
-HRESULT __stdcall TextRenderer::GetPixelsPerDip(void* clientDrawingContext,
-                                                FLOAT* pixelsPerDip) {
-  *pixelsPerDip = 1.0f;
-  return S_OK;
-}
-
-HRESULT __stdcall TextRenderer::DrawGlyphRun(
-    void* clientDrawingContext, FLOAT baselineOriginX, FLOAT baselineOriginY,
-    DWRITE_MEASURING_MODE measuringMode, DWRITE_GLYPH_RUN const* glyphRun,
-    DWRITE_GLYPH_RUN_DESCRIPTION const* glyphRunDescription,
-    IUnknown* clientDrawingEffect) {
-  ComPtr<ID2D1TransformedGeometry> transformedgeometry;
-  ComPtr<ID2D1PathGeometry> pathgeometry;
-  ComPtr<ID2D1GeometrySink> geometrysink;
-
-  float vertical_offset = rendercallback_(glyphRun->fontFace);
-
-  CHECK(d2d1factory_->CreatePathGeometry(&pathgeometry));
-  CHECK(pathgeometry->Open(&geometrysink));
-  {
-    CHECK(glyphRun->fontFace->GetGlyphRunOutline(
-        glyphRun->fontEmSize, glyphRun->glyphIndices, glyphRun->glyphAdvances,
-        glyphRun->glyphOffsets, glyphRun->glyphCount, glyphRun->isSideways,
-        glyphRun->bidiLevel % 2, geometrysink.Get()));
-  }
-  CHECK(geometrysink->Close());
-  D2D1::Matrix3x2F transform =
-      D2D1::Matrix3x2F(1.0f, 0.0f, 0.0f, 1.0f, baselineOriginX,
-                       baselineOriginY + vertical_offset);
-  CHECK(d2d1factory_->CreateTransformedGeometry(pathgeometry.Get(), transform,
-                                                &transformedgeometry));
-
-  rendertarget_->DrawGeometry(transformedgeometry.Get(), outline_brush_.Get(), 3.0f, strokestyle_.Get());
-  rendertarget_->FillGeometry(transformedgeometry.Get(), fill_brush_.Get());
-  return S_OK;
-}
-
-HRESULT __stdcall TextRenderer::DrawUnderline(void* clientDrawingContext,
-                                              FLOAT baselineOriginX,
-                                              FLOAT baselineOriginY,
-                                              DWRITE_UNDERLINE const* underline,
-                                              IUnknown* clientDrawingEffect) {
-  return E_NOTIMPL;
-}
-
-HRESULT __stdcall TextRenderer::DrawStrikethrough(
-    void* clientDrawingContext, FLOAT baselineOriginX, FLOAT baselineOriginY,
-    DWRITE_STRIKETHROUGH const* strikethrough, IUnknown* clientDrawingEffect) {
-  return E_NOTIMPL;
-}
-
-HRESULT __stdcall TextRenderer::DrawInlineObject(
-    void* clientDrawingContext, FLOAT originX, FLOAT originY,
-    IDWriteInlineObject* inlineObject, BOOL isSideways, BOOL isRightToLeft,
-    IUnknown* clientDrawingEffect) {
-  return E_NOTIMPL;
-}
-
-void TextRenderer::Setup(const float (&color)[4], bool outline,
-                         const float (&outline_color)[4]) {
-  D2D1::ColorF d2d1color(color[0], color[1], color[2], color[3]);
-  D2D1::ColorF d2d1outlinecolor(outline_color[0], outline_color[1],
-                                outline_color[2], outline_color[3]);
-  CHECK(rendertarget_->CreateSolidColorBrush(d2d1color, &fill_brush_));
-  CHECK(rendertarget_->CreateSolidColorBrush(d2d1outlinecolor, &outline_brush_));
-
-  D2D1_STROKE_STYLE_PROPERTIES strokeprops = D2D1::StrokeStyleProperties();
-  strokeprops.lineJoin = D2D1_LINE_JOIN_ROUND;
-  d2d1factory_->CreateStrokeStyle(&strokeprops, NULL, 0, &strokestyle_);
-}
-
+}  // namespace simpledwrite

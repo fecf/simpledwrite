@@ -387,5 +387,5 @@ FodyWeavers.xsd
 .idea/
 *.sln.iml
 
-**/*.bmp
+**/*.png
 **/*.bin

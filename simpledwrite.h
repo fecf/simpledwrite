@@ -1,134 +1,152 @@
 #pragma once
 
-#include <d2d1_3.h>
-#include <dwrite_3.h>
-#include <wincodec.h>
-#include <wrl.h>
+// simpledwrite
+// https://github.com/fecf/simpledwrite
 
-#include <functional>
 #include <memory>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
-using namespace Microsoft::WRL;
+namespace simpledwrite {
 
-class TextRenderer;
-class SimpleDirectWrite {
- public:
-  SimpleDirectWrite();
-  virtual ~SimpleDirectWrite();
-
-  struct Config {
-    struct Font {
-      Font(const std::wstring& name, float vertical_offset = 0.0f)
-          : name(name), vertical_offset(vertical_offset) {}
-      Font(const void* data, size_t size, float vertical_offset = 0.0f)
-          : data(data), size(size), vertical_offset(vertical_offset) {}
-
-      const std::wstring name;
-      const void* data = nullptr;
-      size_t size = 0;
-      float vertical_offset = 0.0f;
-    };
-    std::vector<Font> fonts;
-
-    struct Fallback {
-      Fallback(const std::wstring& family,
-               const std::vector<std::pair<uint32_t, uint32_t>>& ranges)
-          : family(family), ranges(ranges) {}
-
-      std::vector<std::pair<uint32_t, uint32_t>> ranges;
-      std::wstring family;
-    };
-    std::vector<Fallback> fallbacks;
-
-    std::wstring locale = L"";
-    uint32_t canvas_width;
-    uint32_t canvas_height;
-  };
-
- public:
-  bool Setup(const Config& config);
-  bool CalcSize(const std::wstring& text, float size, int* width, int* height);
-
-  std::vector<uint8_t> Render(
-      const std::wstring& text, float size,
-      const float (&color)[4] = {0, 0, 0, 1}, bool outline = false,
-      const float (&outline_color)[4] = {1, 1, 1, 1}, int* out_width = nullptr,
-      int* out_height = nullptr);
-  void SaveAsBitmap(const std::wstring& path);
-
- private:
-  Config config_;
-  std::wstring locale_ = L"en-US";
-
-  ComPtr<IWICImagingFactory> wicimagingfactory_;
-  ComPtr<ID2D1Factory7> d2d1factory_;
-  ComPtr<IDWriteFactory7> dwritefactory_;
-  ComPtr<TextRenderer> outlinetextrenderer_;
-
-  ComPtr<IDWriteFontSet> fontset_;
-  ComPtr<IDWriteFontCollection1> fontcollection_;
-  std::unordered_map<std::wstring, Config::Font*> fontfamilymap_;
-  std::wstring firstfamilyname_;
-
-  ComPtr<IDWriteFontFallback> fallback_;
-
-  std::vector<uint8_t> buffer_;
-  ComPtr<IWICBitmap> bitmap_;
-  int maxwidth_ = 1024;
-  int maxheight_ = 256;
-  int roiwidth_ = 0;
-  int roiheight_ = 0;
-  ComPtr<ID2D1RenderTarget> rendertarget_;
+// Same as DWRITE_* enums
+enum class FontWeight {
+  THIN = 100,
+  EXTRA_LIGHT = 200,
+  ULTRA_LIGHT = 200,
+  LIGHT = 300,
+  SEMI_LIGHT = 350,
+  NORMAL = 400,
+  REGULAR = 400,
+  MEDIUM = 500,
+  DEMI_BOLD = 600,
+  SEMI_BOLD = 600,
+  BOLD = 700,
+  EXTRA_BOLD = 800,
+  ULTRA_BOLD = 800,
+  BLACK = 900,
+  HEAVY = 900,
+  EXTRA_BLACK = 950,
+  ULTRA_BLACK = 950
+};
+enum class FontStretch {
+  UNDEFINED = 0,
+  ULTRA_CONDENSED = 1,
+  EXTRA_CONDENSED = 2,
+  CONDENSED = 3,
+  SEMI_CONDENSED = 4,
+  NORMAL = 5,
+  MEDIUM = 5,
+  SEMI_EXPANDED = 6,
+  EXPANDED = 7,
+  EXTRA_EXPANDED = 8,
+  ULTRA_EXPANDED = 9
+};
+enum class FontStyle { NORMAL, OBLIQUE, ITALIC };
+enum class WordWrapMode {
+  WRAP = 0,
+  NO_WRAP = 1,
+  EMERGENCY_BREAK = 2,
+  WHOLE_WORD = 3,
+  CHARACTER = 4,
+};
+enum class AntialiasMode {
+  PER_PRIMITIVE = 0,
+  ALIASED = 1,
+};
+enum class TextAntialiasMode {
+  DEFAULT = 0,
+  CLEARTYPE = 1,
+  GRAYSCALE = 2,
+  ALIASED = 3,
 };
 
-// Custom text renderer class
-// ref. https://stackoverflow.com/questions/66872711/directwrite-direct2d-custom-text-rendering-is-hairy
-class TextRenderer
-    : public RuntimeClass<RuntimeClassFlags<ClassicCom>, IDWriteTextRenderer> {
- private:
-  ComPtr<ID2D1Factory7> d2d1factory_;
-  ComPtr<ID2D1RenderTarget> rendertarget_;
-  std::function<float(IDWriteFontFace*)> rendercallback_;
+struct Font {
+  Font() = default;
+  Font(const std::string& name, float vertical_offset = 0.0f);
+  Font(const void* data, size_t data_size, float vertical_offset = 0.0f);
 
-  ComPtr<ID2D1SolidColorBrush> fill_brush_;
-  ComPtr<ID2D1SolidColorBrush> outline_brush_;
-  ComPtr<ID2D1StrokeStyle> strokestyle_;
-
- private:
-  ~TextRenderer() = default;
-
- public:
-  TextRenderer(ComPtr<ID2D1Factory7> d2d1factory,
-               ComPtr<ID2D1RenderTarget> rendertarget,
-               std::function<float(IDWriteFontFace*)> rendercallback);
-
-  virtual HRESULT __stdcall IsPixelSnappingDisabled(void* clientDrawingContext,
-                                                    BOOL* isDisabled) override;
-  virtual HRESULT __stdcall GetCurrentTransform(
-      void* clientDrawingContext, DWRITE_MATRIX* transform) override;
-  virtual HRESULT __stdcall GetPixelsPerDip(void* clientDrawingContext,
-                                            FLOAT* pixelsPerDip) override;
-  virtual HRESULT __stdcall DrawGlyphRun(
-      void* clientDrawingContext, FLOAT baselineOriginX, FLOAT baselineOriginY,
-      DWRITE_MEASURING_MODE measuringMode, DWRITE_GLYPH_RUN const* glyphRun,
-      DWRITE_GLYPH_RUN_DESCRIPTION const* glyphRunDescription,
-      IUnknown* clientDrawingEffect) override;
-  virtual HRESULT __stdcall DrawUnderline(
-      void* clientDrawingContext, FLOAT baselineOriginX, FLOAT baselineOriginY,
-      DWRITE_UNDERLINE const* underline,
-      IUnknown* clientDrawingEffect) override;
-  virtual HRESULT __stdcall DrawStrikethrough(
-      void* clientDrawingContext, FLOAT baselineOriginX, FLOAT baselineOriginY,
-      DWRITE_STRIKETHROUGH const* strikethrough,
-      IUnknown* clientDrawingEffect) override;
-  virtual HRESULT __stdcall DrawInlineObject(
-      void* clientDrawingContext, FLOAT originX, FLOAT originY,
-      IDWriteInlineObject* inlineObject, BOOL isSideways, BOOL isRightToLeft,
-      IUnknown* clientDrawingEffect) override;
-
-  void Setup(const float (&color)[4], bool outline,
-             const float (&outline_color)[4]);
+  std::string name;
+  const void* data;
+  size_t data_size;
+  float vertical_offset;
 };
+
+struct FallbackFont {
+  FallbackFont() = default;
+  FallbackFont(const std::string& family,
+      const std::vector<std::pair<uint32_t, uint32_t>>& ranges);
+
+  std::vector<std::pair<uint32_t, uint32_t>> ranges;
+  std::string family;
+};
+
+struct FontSet {
+  static FontSet Default();
+  FontSet();
+
+  std::vector<Font> fonts;
+  std::vector<FallbackFont> fallbacks;
+  std::string locale;
+};
+
+struct Layout {
+  float max_width = 0.0f;
+  float max_height = 0.0f;
+  WordWrapMode word_wrap_mode = WordWrapMode::CHARACTER;
+  FontWeight font_weight = FontWeight::NORMAL;
+  FontStretch font_stretch = FontStretch::NORMAL;
+  FontStyle font_style = FontStyle::NORMAL;
+};
+
+struct Color {
+  float r = 0.0f;
+  float g = 0.0f;
+  float b = 0.0f;
+  float a = 1.0f;
+};
+
+struct RenderParams {
+  Color foreground_color = {0, 0, 0, 1};
+  Color background_color = {1, 1, 1, 1};
+  float outline_width = 0.0f;
+  Color outline_color = {1, 1, 1, 1};
+  AntialiasMode antialias_mode = AntialiasMode::PER_PRIMITIVE;
+  TextAntialiasMode text_antialias_mode = TextAntialiasMode::DEFAULT;
+};
+
+class SimpleDWriteImpl;
+class SimpleDWrite {
+ public:
+  SimpleDWrite();
+  virtual ~SimpleDWrite();
+
+  bool Init(const FontSet& fs, float dpi = 96.0f);
+
+  bool CalcSize(const std::string& text, int font_size, int* out_width,
+      int* out_height, int* out_buffer_size = nullptr,
+      const Layout& layout = Layout()) const;
+
+  bool Render(const std::string& text, int font_size, uint8_t* buffer,
+      int buffer_size, const Layout& layout = Layout(),
+      const RenderParams& renderparams = RenderParams(),
+      int* out_width = nullptr, int* out_height = nullptr) const;
+
+  bool Render(const std::string& text, int font_size, uint8_t* buffer,
+      int buffer_size, int* out_width = nullptr,
+      int* out_height = nullptr) const {
+    return Render(text, font_size, buffer, buffer_size, Layout(),
+        RenderParams(), out_width, out_height);
+  }
+
+  std::string GetLastError() const;
+
+ private:
+  mutable std::string last_error_;
+  FontSet fs_;
+  float dpi_;
+
+  std::unique_ptr<SimpleDWriteImpl> impl;
+};
+
+}  // namespace simpledwrite
