@@ -42,9 +42,9 @@ void save_png(const std::string& name, const uint8_t* data, int w, int h) {
 void test_minimal() {
   SimpleDWrite dw;
   std::vector<uint8_t> buf(1024 * 1024 * 4);
-  int w, h;
-  dw.Render("SimpleDWrite", 32, buf.data(), (int)buf.size(), &w, &h);
-  save_png("test_minimal.png", buf.data(), w, h);
+  Layout layout(32);  // font size
+  dw.Render("SimpleDWrite", buf.data(), (int)buf.size(), layout);
+  save_png("test_minimal.png", buf.data(), layout.out_width, layout.out_height);
 }
 
 void test_full() {
@@ -70,17 +70,15 @@ void test_full() {
   }
 
   std::string str = "SimpleDWrite こんにちは 担々麺" ICON_REMIX_GITHUB_LINE;
-  int w, h, size;
-  if (!dw.CalcSize(str, 32, &w, &h, &size)) {
-    std::cerr << "failed SimpleDWrite::CalcSize().";
-    return;
-  }
-  std::vector<uint8_t> buf(size);
-
-  Layout layout;
+  Layout layout(32);  // font size
   layout.font_style = FontStyle::NORMAL;
   layout.font_weight = FontWeight::NORMAL;
   layout.font_stretch = FontStretch::NORMAL;
+  if (!dw.CalcSize(str, layout)) {
+    std::cerr << "failed SimpleDWrite::CalcSize().";
+    return;
+  }
+  std::vector<uint8_t> buf(layout.out_buffer_size);
 
   RenderParams rp;
   rp.background_color = {1.0f, 1.0f, 1.0f, 1.0f};
@@ -88,12 +86,12 @@ void test_full() {
   rp.outline_color = {1.0f, 1.0f, 0.0f, 1.0f};
   rp.outline_width = 4;
 
-  if (!dw.Render(str, 32, buf.data(), size, layout, rp)) {
+  if (!dw.Render(str, buf.data(), (int)buf.size(), layout, rp)) {
     std::cerr << "failed SimpleDWrite::Render().";
     return;
   }
 
-  save_png("test_full.png", buf.data(), w, h);
+  save_png("test_full.png", buf.data(), layout.out_width, layout.out_height);
 }
 
 int main(void) {

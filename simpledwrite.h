@@ -91,12 +91,25 @@ struct FontSet {
 };
 
 struct Layout {
+  Layout() {}
+  Layout(int font_size) : font_size(font_size) {}
+
+  // in
+  int font_size = 16;  // points
   float max_width = 0.0f;
   float max_height = 0.0f;
   WordWrapMode word_wrap_mode = WordWrapMode::CHARACTER;
   FontWeight font_weight = FontWeight::NORMAL;
   FontStretch font_stretch = FontStretch::NORMAL;
   FontStyle font_style = FontStyle::NORMAL;
+
+  // out
+  int out_left = 0;
+  int out_top = 0;
+  int out_width = 0;
+  int out_height = 0;
+  int out_buffer_size = 0;
+  int out_baseline = 0;
 };
 
 struct Color {
@@ -122,23 +135,9 @@ class SimpleDWrite {
   virtual ~SimpleDWrite();
 
   bool Init(const FontSet& fs, float dpi = 96.0f);
-
-  bool CalcSize(const std::string& text, int font_size, int* out_width,
-      int* out_height, int* out_buffer_size = nullptr,
-      const Layout& layout = Layout()) const;
-
-  bool Render(const std::string& text, int font_size, uint8_t* buffer,
-      int buffer_size, const Layout& layout = Layout(),
-      const RenderParams& renderparams = RenderParams(),
-      int* out_width = nullptr, int* out_height = nullptr) const;
-
-  bool Render(const std::string& text, int font_size, uint8_t* buffer,
-      int buffer_size, int* out_width = nullptr,
-      int* out_height = nullptr) const {
-    return Render(text, font_size, buffer, buffer_size, Layout(),
-        RenderParams(), out_width, out_height);
-  }
-
+  bool CalcSize(const std::string& text, Layout& layout) const;
+  bool Render(const std::string& text, uint8_t* buffer, int buffer_size,
+      Layout& layout, const RenderParams& renderparams = RenderParams()) const;
   std::string GetLastError() const;
 
  private:

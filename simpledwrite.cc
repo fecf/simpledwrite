@@ -25,11 +25,10 @@
 #define STR(x) STR_HELPER(x)
 #define CHECK_(hr, file, line)                                         \
   if (FAILED(hr)) {                                                    \
-    _com_error err(hr);                                                \
-    LPCTSTR errmsg = err.ErrorMessage();                               \
-    std::stringstream ss;                                              \
-    ss << "failed at " << file << "@" << line << " reason=" << errmsg; \
-    throw std::runtime_error(ss.str());                                \
+     std::string errmsg = std::system_category().message(hr);           \
+     std::stringstream ss;                                              \
+     ss << "failed at " << file << "@" << line << " reason=" << errmsg; \
+     throw std::runtime_error(ss.str());                                \
   }
 #define CHECK(hr) CHECK_(hr, __FILE__, STR(__LINE__))
 
@@ -195,6 +194,68 @@ class SimpleDWriteImpl {
   }
   virtual ~SimpleDWriteImpl() = default;
 
+  bool calcSize(ComPtr<IDWriteTextLayout> textlayout, Layout& layout) {
+    DWRITE_TEXT_METRICS text_metrics{};
+    CHECK(textlayout->GetMetrics(&text_metrics));
+    const size_t required_size = (int)(text_metrics.width + 0.5f) * 4 *
+                                 (int)(text_metrics.height + 0.5f);
+    layout.out_buffer_size = (int)required_size;
+
+    // DWRITE_OVERHANG_METRICS overhang_metrics{};
+    // CHECK(textlayout->GetOverhangMetrics(&overhang_metrics));
+    // float top = -std::min(0.0f, overhang_metrics.top);
+    // float left = -std::min(0.0f, overhang_metrics.left);
+    // float right = max_width + overhang_metrics.right;
+    // float bottom = max_height + overhang_metrics.bottom;
+
+    float top = 0;
+    float left = 0;
+    float right = text_metrics.width + 0.5f;
+    float bottom = text_metrics.height + 0.5f;
+    int width = (int)(right - left);
+    int height = (int)(bottom - top);
+
+    layout.out_top = (int)top;
+    layout.out_left = (int)left;
+    layout.out_width = width;
+    layout.out_height = height;
+
+    DWRITE_LINE_METRICS line_metrics{};
+    UINT line_count{};
+    CHECK(textlayout->GetLineMetrics(&line_metrics, UINT32_MAX, &line_count));
+    layout.out_baseline = (int)(line_metrics.baseline + 0.5f);
+
+    return true;
+  }
+
+  ComPtr<IDWriteTextFormat> createTextFormat(const Layout& layout, const FontSet& fs, float dpi) {
+    ComPtr<IDWriteTextFormat> textformat;
+    const float dip = layout.font_size / (dpi / 96.0f);
+    CHECK(dwritefactory->CreateTextFormat(firstfamilyname.c_str(),
+        fontcollection.Get(), (DWRITE_FONT_WEIGHT)layout.font_weight,
+        (DWRITE_FONT_STYLE)layout.font_style,
+        (DWRITE_FONT_STRETCH)layout.font_stretch, dip,
+        utf8_to_utf16(fs.locale).c_str(), &textformat));
+    if (fallback) {
+      ComPtr<IDWriteTextFormat3> textformat3;
+      textformat.As(&textformat3);
+      CHECK(textformat3->SetFontFallback(fallback.Get()));
+    }
+    return textformat;
+  }
+
+  ComPtr<IDWriteTextLayout> createTextLayout(ComPtr<IDWriteTextFormat> textformat,
+      const Layout& layout, const std::string& text) {
+    std::wstring wtext = utf8_to_utf16(text);
+    float max_width = layout.max_width ? layout.max_width : kMaxLayoutSize;
+    float max_height = layout.max_height ? layout.max_height : kMaxLayoutSize;
+    ComPtr<IDWriteTextLayout> textlayout;
+    CHECK(dwritefactory->CreateTextLayout(wtext.c_str(), (UINT32)wtext.length(),
+        textformat.Get(), max_width, max_height, &textlayout));
+    textlayout->SetWordWrapping((DWRITE_WORD_WRAPPING)layout.word_wrap_mode);
+    return textlayout;
+  }
+
   ComPtr<ID2D1Factory7> d2d1factory;
   ComPtr<IDWriteFactory7> dwritefactory;
   ComPtr<IWICImagingFactory2> wicimagingfactory;
@@ -358,41 +419,13 @@ bool SimpleDWrite::Init(const FontSet& fs, float dpi) {
   return false;
 }
 
-bool SimpleDWrite::CalcSize(const std::string& text, int font_size,
-    int* out_width, int* out_height, int* out_buffer_size,
-    const Layout& layout) const {
-  const float dip = font_size / (dpi_ / 96.0f);
-
+bool SimpleDWrite::CalcSize(const std::string& text, Layout& layout) const {
   try {
-    ComPtr<IDWriteTextFormat> format;
-    CHECK(impl->dwritefactory->CreateTextFormat(impl->firstfamilyname.c_str(),
-        impl->fontcollection.Get(), (DWRITE_FONT_WEIGHT)layout.font_weight,
-        (DWRITE_FONT_STYLE)layout.font_style,
-        (DWRITE_FONT_STRETCH)layout.font_stretch, dip,
-        utf8_to_utf16(fs_.locale).c_str(), &format));
-
-    if (impl->fallback) {
-      ComPtr<IDWriteTextFormat3> format3;
-      format.As(&format3);
-      CHECK(format3->SetFontFallback(impl->fallback.Get()));
+    ComPtr<IDWriteTextFormat> textformat = impl->createTextFormat(layout, fs_, dpi_);
+    ComPtr<IDWriteTextLayout> textlayout = impl->createTextLayout(textformat, layout, text);
+    if (!impl->calcSize(textlayout, layout)) {
+      return false;
     }
-
-    ComPtr<IDWriteTextLayout> textlayout;
-    std::wstring wtext = utf8_to_utf16(text);
-    float max_width = layout.max_width ? layout.max_width : kMaxLayoutSize;
-    float max_height = layout.max_height ? layout.max_height : kMaxLayoutSize;
-    CHECK(impl->dwritefactory->CreateTextLayout(wtext.c_str(),
-        (UINT32)wtext.length(), format.Get(), max_width, max_height,
-        &textlayout));
-    textlayout->SetWordWrapping((DWRITE_WORD_WRAPPING)layout.word_wrap_mode);
-
-    DWRITE_TEXT_METRICS metrics{};
-    CHECK(textlayout->GetMetrics(&metrics));
-    int iw = (int)(metrics.width + 0.5f);
-    int ih = (int)(metrics.height + 0.5f);
-    if (out_width != nullptr) *out_width = iw;
-    if (out_height != nullptr) *out_height = ih;
-    if (out_buffer_size != nullptr) *out_buffer_size = iw * 4 * ih;
     return true;
   } catch (std::exception& ex) {
     last_error_ = ex.what();
@@ -400,49 +433,25 @@ bool SimpleDWrite::CalcSize(const std::string& text, int font_size,
   }
 }
 
-bool SimpleDWrite::Render(const std::string& text, int font_size,
-    uint8_t* buffer, int buffer_size, const Layout& layout,
-    const RenderParams& renderparams, int* out_width, int* out_height) const {
-  const float dip = font_size / (dpi_ / 96.0f);
-
+bool SimpleDWrite::Render(const std::string& text, uint8_t* buffer,
+    int buffer_size, Layout& layout, const RenderParams& renderparams) const {
   try {
-    ComPtr<IDWriteTextFormat> format;
-    CHECK(impl->dwritefactory->CreateTextFormat(impl->firstfamilyname.c_str(),
-        impl->fontcollection.Get(), (DWRITE_FONT_WEIGHT)layout.font_weight,
-        (DWRITE_FONT_STYLE)layout.font_style,
-        (DWRITE_FONT_STRETCH)layout.font_stretch, dip,
-        utf8_to_utf16(fs_.locale).c_str(), &format));
-
-    if (impl->fallback) {
-      ComPtr<IDWriteTextFormat3> format3;
-      format.As(&format3);
-      CHECK(format3->SetFontFallback(impl->fallback.Get()));
+    ComPtr<IDWriteTextFormat> textformat = impl->createTextFormat(layout, fs_, dpi_);
+    ComPtr<IDWriteTextLayout> textlayout = impl->createTextLayout(textformat, layout, text);
+    if (!impl->calcSize(textlayout, layout)) {
+      return false;
     }
 
-    std::wstring wtext = utf8_to_utf16(text);
-    ComPtr<IDWriteTextLayout> textlayout;
-    float max_width = layout.max_width ? layout.max_width : kMaxLayoutSize;
-    float max_height = layout.max_height ? layout.max_height : kMaxLayoutSize;
-    CHECK(impl->dwritefactory->CreateTextLayout(wtext.c_str(),
-        (UINT32)wtext.length(), format.Get(), max_width, max_height,
-        &textlayout));
-    textlayout->SetWordWrapping((DWRITE_WORD_WRAPPING)layout.word_wrap_mode);
-
-    DWRITE_TEXT_METRICS metrics{};
-    CHECK(textlayout->GetMetrics(&metrics));
-    int iw = (int)(metrics.width + 0.5f);
-    int ih = (int)(metrics.height + 0.5f);
-    if (out_width != nullptr) *out_width = iw;
-    if (out_height != nullptr) *out_height = ih;
-    const size_t required_size = iw * 4 * ih;
-    if (required_size > buffer_size) {
+    if (layout.out_buffer_size > buffer_size) {
       last_error_ = "not enough buffer size.";
       return false;
     }
 
     ComPtr<IWICBitmap> bitmap;
-    CHECK(impl->wicimagingfactory->CreateBitmapFromMemory((UINT)iw, (UINT)ih,
-        GUID_WICPixelFormat32bppPBGRA, (UINT)(iw * 4), (UINT)(iw * 4 * ih),
+    CHECK(impl->wicimagingfactory->CreateBitmapFromMemory(
+        (UINT)(layout.out_width + 0.5f), (UINT)(layout.out_height + 0.5f),
+        GUID_WICPixelFormat32bppPBGRA, (UINT)(layout.out_width + 0.5f) * 4,
+        (UINT)(layout.out_width + 0.5f) * 4 * (UINT)(layout.out_height + 0.5f),
         buffer, &bitmap));
 
     ComPtr<ID2D1RenderTarget> rendertarget;
@@ -476,14 +485,17 @@ bool SimpleDWrite::Render(const std::string& text, int font_size,
     rendertarget->EndDraw();
 
     WICRect rect{};
-    rect.Width = (INT)iw;
-    rect.Height = (INT)ih;
-    const int stride = rect.Width * 4;
-    if (stride * rect.Height > buffer_size) {
+    rect.X = (INT)layout.out_left;
+    rect.Y = (INT)layout.out_top;
+    rect.Width = (INT)layout.out_width;
+    rect.Height = (INT)layout.out_height;
+    const int stride = ((INT)(layout.out_width + 0.5f)) * 4;
+    if (rect.Width * 4 * rect.Height > buffer_size) {
       last_error_ = "not enough buffer size.";
       return false;
     }
-    bitmap->CopyPixels(&rect, stride, static_cast<UINT>(buffer_size), buffer);
+    CHECK(bitmap->CopyPixels(&rect, rect.Width * 4 /* dst stride */,
+        static_cast<UINT>(buffer_size), buffer));
     return true;
   } catch (std::exception& ex) {
     last_error_ = ex.what();
