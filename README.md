@@ -7,8 +7,9 @@ Simple DirectWrite Wrapper
 ```
   SimpleDWrite dw;
   std::vector<uint8_t> buf(1024 * 1024 * 4);
-  int w, h;
-  dw.Render("SimpleDWrite", 32, buf.data(), (int)buf.size(), &w, &h);
+  Layout layout(32);  // font size
+  dw.Render("SimpleDWrite", buf.data(), (int)buf.size(), layout);
+  save_png("test_minimal.png", buf.data(), layout.out_width, layout.out_height);
 ```
 
 ## Full example
