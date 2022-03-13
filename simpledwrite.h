@@ -96,18 +96,20 @@ struct Layout {
 
   // in
   int font_size = 16;  // points
-  float max_width = 0.0f;
-  float max_height = 0.0f;
+  float max_width = 16384.0f;
+  float max_height = 16384.0f;
   WordWrapMode word_wrap_mode = WordWrapMode::CHARACTER;
   FontWeight font_weight = FontWeight::NORMAL;
   FontStretch font_stretch = FontStretch::NORMAL;
   FontStyle font_style = FontStyle::NORMAL;
 
   // out
-  int out_left = 0;
-  int out_top = 0;
   int out_width = 0;
   int out_height = 0;
+  int out_padding_top = 0;
+  int out_padding_left = 0;
+  int out_padding_right = 0;
+  int out_padding_bottom = 0;
   int out_buffer_size = 0;
   int out_baseline = 0;
 };

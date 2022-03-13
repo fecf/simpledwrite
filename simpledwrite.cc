@@ -201,29 +201,19 @@ class SimpleDWriteImpl {
                                  (int)(text_metrics.height + 0.5f);
     layout.out_buffer_size = (int)required_size;
 
-    // DWRITE_OVERHANG_METRICS overhang_metrics{};
-    // CHECK(textlayout->GetOverhangMetrics(&overhang_metrics));
-    // float top = -std::min(0.0f, overhang_metrics.top);
-    // float left = -std::min(0.0f, overhang_metrics.left);
-    // float right = max_width + overhang_metrics.right;
-    // float bottom = max_height + overhang_metrics.bottom;
-
-    float top = 0;
-    float left = 0;
-    float right = text_metrics.width + 0.5f;
-    float bottom = text_metrics.height + 0.5f;
-    int width = (int)(right - left);
-    int height = (int)(bottom - top);
-
-    layout.out_top = (int)top;
-    layout.out_left = (int)left;
-    layout.out_width = width;
-    layout.out_height = height;
+    DWRITE_OVERHANG_METRICS overhang_metrics{};
+    CHECK(textlayout->GetOverhangMetrics(&overhang_metrics));
+    layout.out_width = (int)(text_metrics.width + 0.5f);
+    layout.out_height = (int)(text_metrics.height + 0.5f);
+    layout.out_padding_top = (int)(-std::min(0.0f, overhang_metrics.top));
+    layout.out_padding_left = (int)(-std::min(0.0f, overhang_metrics.left));
+    layout.out_padding_right = layout.out_width - (int)(layout.max_width + overhang_metrics.right);
+    layout.out_padding_bottom = layout.out_height - (int)(layout.max_height + overhang_metrics.bottom);
 
     DWRITE_LINE_METRICS line_metrics{};
     UINT line_count{};
     CHECK(textlayout->GetLineMetrics(&line_metrics, UINT32_MAX, &line_count));
-    layout.out_baseline = (int)(line_metrics.baseline + 0.5f);
+    layout.out_baseline = (int)(line_metrics.baseline - overhang_metrics.top + 0.5f);
 
     return true;
   }
@@ -247,11 +237,10 @@ class SimpleDWriteImpl {
   ComPtr<IDWriteTextLayout> createTextLayout(ComPtr<IDWriteTextFormat> textformat,
       const Layout& layout, const std::string& text) {
     std::wstring wtext = utf8_to_utf16(text);
-    float max_width = layout.max_width ? layout.max_width : kMaxLayoutSize;
-    float max_height = layout.max_height ? layout.max_height : kMaxLayoutSize;
     ComPtr<IDWriteTextLayout> textlayout;
     CHECK(dwritefactory->CreateTextLayout(wtext.c_str(), (UINT32)wtext.length(),
-        textformat.Get(), max_width, max_height, &textlayout));
+        textformat.Get(), (FLOAT)layout.max_width, (FLOAT)layout.max_height,
+        &textlayout));
     textlayout->SetWordWrapping((DWRITE_WORD_WRAPPING)layout.word_wrap_mode);
     return textlayout;
   }
@@ -485,8 +474,8 @@ bool SimpleDWrite::Render(const std::string& text, uint8_t* buffer,
     rendertarget->EndDraw();
 
     WICRect rect{};
-    rect.X = (INT)layout.out_left;
-    rect.Y = (INT)layout.out_top;
+    rect.X = 0;
+    rect.Y = 0;
     rect.Width = (INT)layout.out_width;
     rect.Height = (INT)layout.out_height;
     const int stride = ((INT)(layout.out_width + 0.5f)) * 4;
