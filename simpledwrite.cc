@@ -301,20 +301,61 @@ bool SimpleDWrite::Init(const FontSet& fs, float dpi) {
       }
     }
 
+    if (fs_.fonts.empty()) {
+      // ref. https://stackoverflow.com/questions/41505151/how-to-draw-text-with-the-default-ui-font-in-directwrite
+      NONCLIENTMETRICSW ncm{sizeof(ncm)};
+      BOOL ret = ::SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, ncm.cbSize, &ncm, 0);
+      if (ret == FALSE) {
+        last_error_ = "failed ::SystemParametersInfoW().";
+        return false;
+      }
+
+      ComPtr<IDWriteGdiInterop> gdiinterop;
+      CHECK(impl->dwritefactory->GetGdiInterop(&gdiinterop));
+      ComPtr<IDWriteFont> sysfont;
+      CHECK(gdiinterop->CreateFontFromLOGFONT(&ncm.lfMessageFont, &sysfont));
+
+      ComPtr<IDWriteFontFamily> family;
+      CHECK(sysfont->GetFontFamily(&family));
+      ComPtr<IDWriteLocalizedStrings> familyname;
+      CHECK(family->GetFamilyNames(&familyname));
+      thread_local wchar_t buf[1024]{};
+      CHECK(familyname->GetString(0, buf, 1024));
+      fs_.fonts.push_back(Font(utf16_to_utf8(buf)));
+    }
+
     ComPtr<IDWriteFactory7> factory = impl->dwritefactory;
     ComPtr<IDWriteInMemoryFontFileLoader> memoryfontfileloader;
     CHECK(factory->CreateInMemoryFontFileLoader(&memoryfontfileloader));
     CHECK(factory->RegisterFontFileLoader(memoryfontfileloader.Get()));
-
     ComPtr<IDWriteFontSetBuilder2> fontsetbuilder;
     CHECK(factory->CreateFontSetBuilder(&fontsetbuilder));
-
     ComPtr<IDWriteFontCollection> systemfontcollection;
     CHECK(factory->GetSystemFontCollection(&systemfontcollection));
 
     std::vector<Font*> fontconfiglist;
-    for (const Font& font : fs.fonts) {
-      if (!font.name.empty()) {
+    for (const Font& font : fs_.fonts) {
+      if (font.data != nullptr && font.data_size) {
+        ComPtr<IDWriteFontFile> fontfile;
+        CHECK(memoryfontfileloader->CreateInMemoryFontFileReference(
+            factory.Get(), font.data, (UINT32)font.data_size, NULL,
+            &fontfile));
+        BOOL supported = FALSE;
+        DWRITE_FONT_FILE_TYPE filetype{};
+        DWRITE_FONT_FACE_TYPE facetype{};
+        UINT32 faces = 0;
+        CHECK(fontfile->Analyze(&supported, &filetype, &facetype, &faces));
+        if (supported && faces) {
+          CHECK(fontsetbuilder->AddFontFile(fontfile.Get()));
+        }
+        fontconfiglist.insert(
+            fontconfiglist.end(), (size_t)faces, (Font*)&font);
+      } else {
+        if (font.name.empty()) {
+          last_error_ = "Font::name is empty.";
+          return false;
+        }
+
         UINT32 index = 0;
         BOOL exists = FALSE;
         CHECK(systemfontcollection->FindFamilyName(
@@ -335,26 +376,13 @@ bool SimpleDWrite::Init(const FontSet& fs, float dpi) {
           CHECK(font.As(&font3));
           ComPtr<IDWriteFontFaceReference> fontfacereference;
           CHECK(font3->GetFontFaceReference(&fontfacereference));
-          CHECK(fontsetbuilder2->AddFontFaceReference(fontfacereference.Get()));
+          CHECK(
+              fontsetbuilder2->AddFontFaceReference(fontfacereference.Get()));
         }
         ComPtr<IDWriteFontSet> systemfontset;
         CHECK(fontsetbuilder2->CreateFontSet(&systemfontset));
         CHECK(fontsetbuilder->AddFontSet(systemfontset.Get()));
         fontconfiglist.insert(fontconfiglist.end(), (size_t)1, (Font*)&font);
-      } else if (font.data != nullptr && font.data_size) {
-        ComPtr<IDWriteFontFile> fontfile;
-        CHECK(memoryfontfileloader->CreateInMemoryFontFileReference(
-            factory.Get(), font.data, (UINT32)font.data_size, NULL, &fontfile));
-        BOOL supported = FALSE;
-        DWRITE_FONT_FILE_TYPE filetype{};
-        DWRITE_FONT_FACE_TYPE facetype{};
-        UINT32 faces = 0;
-        CHECK(fontfile->Analyze(&supported, &filetype, &facetype, &faces));
-        if (supported && faces) {
-          CHECK(fontsetbuilder->AddFontFile(fontfile.Get()));
-        }
-        fontconfiglist.insert(
-            fontconfiglist.end(), (size_t)faces, (Font*)&font);
       }
     }
 
@@ -385,7 +413,7 @@ bool SimpleDWrite::Init(const FontSet& fs, float dpi) {
 
     ComPtr<IDWriteFontFallbackBuilder> fallbackbuilder;
     CHECK(factory->CreateFontFallbackBuilder(&fallbackbuilder));
-    for (const FallbackFont& fallback : fs.fallbacks) {
+    for (const FallbackFont& fallback : fs_.fallbacks) {
       std::vector<DWRITE_UNICODE_RANGE> ranges;
       for (const std::pair<uint32_t, uint32_t>& pair : fallback.ranges) {
         DWRITE_UNICODE_RANGE range{};
