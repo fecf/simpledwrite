@@ -210,10 +210,15 @@ class SimpleDWriteImpl {
     layout.out_padding_right = layout.out_width - (int)(layout.max_width + overhang_metrics.right);
     layout.out_padding_bottom = layout.out_height - (int)(layout.max_height + overhang_metrics.bottom);
 
-    DWRITE_LINE_METRICS line_metrics{};
-    UINT line_count{};
-    CHECK(textlayout->GetLineMetrics(&line_metrics, UINT32_MAX, &line_count));
-    layout.out_baseline = (int)(line_metrics.baseline - overhang_metrics.top + 0.5f);
+    std::vector<DWRITE_LINE_METRICS> line_metrics(text_metrics.lineCount);
+    UINT32 line_count = 0;
+    CHECK(textlayout->GetLineMetrics(
+        line_metrics.data(), (UINT32)line_metrics.size(), &line_count));
+
+    if (!line_metrics.empty()) {
+      layout.out_baseline =
+          (int)(line_metrics.front().baseline - overhang_metrics.top + 0.5f);
+    }
 
     return true;
   }

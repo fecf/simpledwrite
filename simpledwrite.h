@@ -111,7 +111,7 @@ struct Layout {
   int out_padding_right = 0;
   int out_padding_bottom = 0;
   int out_buffer_size = 0;
-  int out_baseline = 0;
+  int out_baseline = 0;  // baseline height of first line
 };
 
 struct Color {
